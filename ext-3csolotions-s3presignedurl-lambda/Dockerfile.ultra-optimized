@@ -1,0 +1,60 @@
+# Ultra-Optimized Dockerfile for AWS Lambda
+# Target: ~2-3 second cold starts (vs 5-6 seconds)
+# Image size: ~180-200MB (vs 266MB)
+
+# Stage 1: Build dependencies
+FROM python:3.12-slim AS builder
+
+# Install minimal build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy optimized requirements (without boto3/uvicorn/unused packages)
+COPY requirements.optimized.txt requirements.txt
+
+# Install dependencies
+RUN pip3 install --no-cache-dir --upgrade pip && \
+    pip3 install --no-cache-dir -r requirements.txt && \
+    pip3 install --no-cache-dir awslambdaric==2.2.1
+
+# Pre-compile Python files to bytecode (.pyc)
+# This happens at build time instead of cold start
+RUN python -m compileall -b /usr/local/lib/python3.12/site-packages
+
+# Stage 2: Ultra-slim production image
+FROM python:3.12-slim
+
+# Install only ca-certificates (minimal runtime dependency)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /var/task
+
+# Copy compiled Python packages
+COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+# Copy application code
+COPY main.py .
+COPY src/ ./src/
+
+# Pre-compile application code to bytecode
+RUN python -m compileall -b /var/task && \
+    find /var/task -name "*.py" -type f -delete && \
+    find /var/task -name "*.pyc" -exec sh -c 'mv {} $(dirname {})/$(basename {} .pyc).py' \;
+
+# Optimize Python runtime
+ENV PYTHONOPTIMIZE=2 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    LAMBDA_TASK_ROOT=/var/task \
+    LAMBDA_RUNTIME_DIR=/var/runtime \
+    PYTHONPATH=/var/task
+
+# Use Lambda RIC
+ENTRYPOINT ["/usr/local/bin/python", "-m", "awslambdaric"]
+CMD ["main.lambda_handler"]

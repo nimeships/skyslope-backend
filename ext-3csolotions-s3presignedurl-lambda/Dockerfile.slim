@@ -1,0 +1,53 @@
+# Multi-stage Dockerfile using python:3.12-slim for AWS Lambda
+# Manually installs Lambda Runtime Interface Client
+
+# Stage 1: Build dependencies
+FROM python:3.12-slim AS builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /app
+
+# Copy requirements and install dependencies
+COPY requirements.txt .
+
+# Install Python dependencies including Lambda RIC
+RUN pip3 install --no-cache-dir --upgrade pip && \
+    pip3 install --no-cache-dir -r requirements.txt && \
+    pip3 install --no-cache-dir awslambdaric==2.2.1
+
+# Stage 2: Production image
+FROM python:3.12-slim
+
+# Install runtime dependencies (if any C extensions need them)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory to /var/task (Lambda convention)
+WORKDIR /var/task
+
+# Copy installed dependencies from builder
+COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+# Copy application code
+COPY main.py .
+COPY src/ ./src/
+
+# Set Lambda runtime environment variables
+ENV LAMBDA_TASK_ROOT=/var/task
+ENV LAMBDA_RUNTIME_DIR=/var/runtime
+
+# Add Python path
+ENV PYTHONPATH=/var/task
+
+# Set the entry point to use Lambda RIC
+ENTRYPOINT ["/usr/local/bin/python", "-m", "awslambdaric"]
+
+# Set the Lambda handler
+CMD ["main.lambda_handler"]

@@ -1,0 +1,23 @@
+# Development Dependencies
+# Install with: pip install -r requirements.txt -r requirements.dev.txt
+
+# Production dependencies
+-r requirements.txt
+
+# Local Development Server
+uvicorn==0.27.1           # For local testing: uvicorn main:app --reload
+
+# Testing (for future)
+pytest==7.4.3
+pytest-asyncio==0.21.1
+httpx==0.25.2             # For TestClient in FastAPI tests
+moto==4.2.9               # Mock AWS services for testing
+
+# Code Quality
+black==23.12.1            # Code formatter
+flake8==6.1.0             # Linter
+mypy==1.7.1               # Type checker
+
+# Debugging
+ipython==8.18.1           # Better Python shell
+ipdb==0.13.13             # Debugger

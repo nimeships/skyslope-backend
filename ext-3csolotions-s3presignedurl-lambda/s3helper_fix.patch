@@ -1,0 +1,29 @@
+--- src/utils/s3helper.py.original
++++ src/utils/s3helper.py.fixed
+@@ -14,7 +14,8 @@
+     def sanitize_filename(self, name: str) -> str:
+         """
+         Keep it filesystem/S3-key friendly: letters, digits, dot, dash, underscore.
++        Note: Extensions are now optional - file type is validated via content_type.
+         """
+         try:
+             self.logger.info(f"Sanitizing filename: {name}")
+             # Split off any path the client might pass and keep the basename
+@@ -23,9 +24,13 @@
+             base = base.strip()
+             # Enforce only safe chars
+             safe = re.sub(r"[^A-Za-z0-9._-]", "_", base)
+-            # Ensure there's a .zip if nothing else was provided
+-            if "." not in safe:
+-                safe += ".zip"
++
++            # NOTE: We no longer auto-add .zip extension
++            # File extensions are now optional (Windows-friendly)
++            # File type validation happens via content_type and magic bytes
++
++            if not safe:  # Empty after sanitization
++                raise ValueError("Filename cannot be empty after sanitization")
++
+             self.logger.info(f"Sanitized filename: {safe}")
+             return safe
+         except Exception as e:

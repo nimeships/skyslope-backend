@@ -1,0 +1,125 @@
+# ============================================================================
+# .dockerignore - Exclude files from Docker build context
+# Critical for smaller images and faster builds
+# ============================================================================
+
+# Documentation (not needed in Lambda)
+*.md
+docs/
+README*
+CHANGELOG*
+LICENSE*
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+.travis.yml
+
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments (never copy these!)
+venv/
+env/
+ENV/
+.venv
+.virtualenv
+
+# Testing (not needed in Lambda)
+tests/
+test/
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+pytest.ini
+.coveragerc
+
+# IDE files (never needed)
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.sublime-project
+*.sublime-workspace
+
+# Development dependencies
+requirements.dev.txt
+requirements.txt.backup
+
+# Environment files (use Lambda env vars instead)
+.env
+.env.local
+.env.test
+.env.*.local
+
+# Docker files (don't include Docker in Docker!)
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Logs and databases (never in Lambda!)
+*.log
+*.db
+*.sqlite
+*.sqlite3
+logs/
+
+# AWS credentials (NEVER include these!)
+.aws/
+credentials
+config
+
+# Jupyter notebooks (not needed in Lambda)
+*.ipynb
+.ipynb_checkpoints/
+
+# Backup files
+*.backup
+*.bak
+*.tmp
+*~
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Response files (testing artifacts)
+response.json
+
+# Old/backup Docker files
+Dockerfile.backup
+Dockerfile.old
+Dockerfile.with-mssql
+
+# Performance optimization guide (not needed at runtime)
+PERFORMANCE_OPTIMIZATION.md
+MSSQL_SUPPORT.md
+REQUIREMENTS_OPTIMIZATION.md
+
+# ============================================================================
+# What IS included (everything else):
+# ============================================================================
+# ✅ main.py
+# ✅ src/ directory
+# ✅ requirements.txt (current, optimized version only)
+#
+# Final build context: ~500KB (was potentially 50MB+ without .dockerignore)
+# ============================================================================

@@ -1,0 +1,20 @@
+# Test dependencies for ext-3csolotions-s3presignedurl-lambda
+
+# Testing frameworks
+pytest==7.4.3                  # Test runner
+pytest-cov==4.1.0              # Code coverage measurement
+pytest-asyncio==0.21.1         # Async test support
+pytest-mock==3.12.0            # Enhanced mocking
+
+# AWS mocking
+moto[all]==4.2.9              # Mock AWS services (S3, DynamoDB)
+
+# Additional testing tools
+faker==20.1.0                  # Generate fake data for tests
+responses==0.24.1              # Mock HTTP requests
+freezegun==1.4.0              # Mock datetime for testing
+
+# Code quality
+black==23.12.1                 # Code formatter
+flake8==6.1.0                  # Linter
+mypy==1.7.1                    # Type checker

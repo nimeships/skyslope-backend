@@ -1,0 +1,50 @@
+# Ultra-Optimized Production Dependencies
+# Trimmed for minimal Lambda package size and fastest cold start
+# Updated: 2026-02-06
+
+# Core Framework (Required)
+fastapi==0.109.2          # ~10MB - API framework
+pydantic==2.6.1           # ~8MB - Request/response validation
+
+# Lambda Integration (Required)
+mangum==0.17.0            # ~50KB - Lambda adapter for FastAPI
+
+# AWS SDK (Required for reliability)
+# While Lambda provides boto3/botocore, we include them to:
+# 1. Ensure consistent version across environments
+# 2. Enable local Docker testing
+# 3. Control exact version for compatibility
+boto3==1.34.52            # ~30MB - AWS SDK
+botocore==1.34.52         # ~15MB - AWS SDK core
+
+# ============================================================================
+# REMOVED PACKAGES (with justification):
+# ============================================================================
+#
+# ❌ uvicorn==0.27.1
+#    Reason: Only needed for local development (uvicorn main:app --reload)
+#    Lambda uses mangum adapter, not uvicorn server
+#    Size saved: ~15MB
+#    Available in: requirements.dev.txt
+#
+# ❌ python-multipart==0.0.9
+#    Reason: No file uploads in API (presign URLs don't upload through Lambda)
+#    FastAPI will warn if needed, but we don't use Form() or File()
+#    Size saved: ~2MB
+#
+# ❌ email-validator==2.1.0
+#    Reason: No email fields in any Pydantic models
+#    Would be needed only if using EmailStr type
+#    Size saved: ~5MB
+#
+# ============================================================================
+
+# Total package size: ~63MB (was 90MB)
+# Expected image size: ~240-250MB (acceptable tradeoff for reliability)
+# Expected cold start: ~2.5-3 seconds
+
+# Note: If you want to use Lambda's built-in boto3 (saves 45MB):
+# 1. Comment out boto3/botocore above
+# 2. Rebuild image
+# 3. Accept that local Docker testing won't work without mocking
+# 4. Verify Lambda's boto3 version is sufficient for your needs
