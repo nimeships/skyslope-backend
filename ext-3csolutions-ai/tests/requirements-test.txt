@@ -1,0 +1,19 @@
+# Test dependencies for ext-3csolutions-ai
+
+# Testing frameworks
+pytest==8.0.2                  # Test runner
+pytest-cov==4.1.0              # Code coverage measurement
+pytest-asyncio==0.21.1         # Async test support
+pytest-mock==3.12.0            # Enhanced mocking
+
+# AWS mocking
+moto[all]==5.0.2              # Mock AWS services (S3, DynamoDB, Textract)
+
+# Additional testing tools
+faker==22.6.0                  # Generate fake data for tests
+freezegun==1.4.0              # Mock datetime for testing
+
+# Code quality (optional but recommended)
+black==24.2.0                  # Code formatter
+mypy==1.8.0                    # Type checker
+bandit==1.7.7                  # Security linter

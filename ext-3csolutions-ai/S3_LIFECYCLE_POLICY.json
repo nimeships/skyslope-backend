@@ -1,0 +1,86 @@
+{
+  "Rules": [
+    {
+      "Id": "DeleteInputFilesAfter7Days",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "input/"
+      },
+      "Expiration": {
+        "Days": 7
+      },
+      "NoncurrentVersionExpiration": {
+        "NoncurrentDays": 1
+      }
+    },
+    {
+      "Id": "TransitionProcessedToGlacierAfter30Days",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "processed/"
+      },
+      "Transitions": [
+        {
+          "Days": 30,
+          "StorageClass": "GLACIER"
+        }
+      ],
+      "Expiration": {
+        "Days": 90
+      }
+    },
+    {
+      "Id": "TransitionTextractToGlacierAfter30Days",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "textract/"
+      },
+      "Transitions": [
+        {
+          "Days": 30,
+          "StorageClass": "GLACIER"
+        }
+      ],
+      "Expiration": {
+        "Days": 90
+      }
+    },
+    {
+      "Id": "ArchiveOutputAfter90Days",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "output/"
+      },
+      "Transitions": [
+        {
+          "Days": 30,
+          "StorageClass": "GLACIER"
+        }
+      ],
+      "Expiration": {
+        "Days": 365
+      },
+      "NoncurrentVersionExpiration": {
+        "NoncurrentDays": 30
+      }
+    },
+    {
+      "Id": "DeleteUnzippedFilesAfter7Days",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "unzipped/"
+      },
+      "Expiration": {
+        "Days": 7
+      }
+    },
+    {
+      "Id": "DeleteIncompleteMultipartUploads",
+      "Status": "Enabled",
+      "Filter": {},
+      "AbortIncompleteMultipartUpload": {
+        "DaysAfterInitiation": 1
+      }
+    }
+  ]
+}
