@@ -11,6 +11,10 @@ class DownloadRequest(BaseModel):
         max_length=100,
         description="Unique identifier for the output file (format: {uuid}_{timestamp})"
     )
+    testing: bool = Field(
+        False,
+        description="Flag to indicate if the request is for testing purposes"
+    )
 
     _validate_unique_id = validator('unique_id', allow_reuse=True)(validate_unique_id_format)
 

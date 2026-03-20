@@ -8,3 +8,4 @@ class DownloadResponse(BaseModel):
     key: str
     download_url: str
     expires_in: int
+    testing: bool = False

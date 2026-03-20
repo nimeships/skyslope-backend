@@ -87,6 +87,7 @@ class ThreeCSolutionController:
             key=details["key"],
             download_url=details["url"],
             expires_in=self.env.presigned_url_expiration,
+            testing=request.testing
         )
 
     def get_pipeline_status(self, request: MonitorRequest) -> MonitorResponse:
@@ -132,6 +133,17 @@ def get_controller() -> ThreeCSolutionController:
         controller = ThreeCSolutionController()
     return controller
 
+@router.get("/test", status_code=status.HTTP_200_OK)
+async def test_check():
+    """test check endpoint"""
+    try:
+        return {"message": "Test endpoint is working", "status": "healthy"}
+    except ThreeCSolutionError as e:
+        logger.error(f"Health check failed: {e}")
+        raise HTTPException(status_code=e.status_code, detail=_safe_detail(e))
+    except Exception as e:
+        logger.error(f"Unexpected error in health check: {e}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
 
 @router.get("/health", status_code=status.HTTP_200_OK)
 async def health_check():
