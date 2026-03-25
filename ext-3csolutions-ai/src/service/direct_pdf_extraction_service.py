@@ -204,8 +204,8 @@ class DirectPDFExtractionService:
         combined_pattern = "|".join(DirectPDFExtractionService._DATE_PATTERNS)
         for idx, match in enumerate(re.finditer(combined_pattern, raw_value)):
             token = match.group(0)
-            window_start = max(0, match.start() - 24)
-            window_end = min(len(raw_value), match.end() + 24)
+            window_start = max(0, match.start() - 50)
+            window_end = min(len(raw_value), match.end() + 50)
             context = lowered[window_start:window_end]
 
             score = 0
@@ -213,7 +213,7 @@ class DirectPDFExtractionService:
                 score += 4
             if any(hint in context for hint in DirectPDFExtractionService._VALUE_INVALID_HINTS):
                 score -= 4
-            score += idx * 0.8  # Later occurrence often corresponds to corrected replacement.
+            score -= idx * 0.5  # Prefer earlier/top-most candidate when no correction cues exist.
 
             candidates.append({
                 "token": token,
@@ -233,12 +233,15 @@ class DirectPDFExtractionService:
             return value
 
         has_invalid_marker = any(hint in raw.lower() for hint in self._VALUE_INVALID_HINTS)
-        selected = max(candidates, key=lambda item: (item["score"], item["index"]))
+        selected = max(candidates, key=lambda item: (item["score"], -item["index"]))
 
         has_positive_candidate = any(candidate["score"] > 0 for candidate in candidates)
 
+        if not has_positive_candidate and len(candidates) >= 2:
+            selected = candidates[0]
+
         # If all detected candidates appear invalidated and no replacement signal exists, return null.
-        if field == "SettlementDate" and has_invalid_marker and not has_positive_candidate:
+        if field == "SettlementDate" and has_invalid_marker and not has_positive_candidate and len(candidates) == 1:
             logger.warning(
                 "SettlementDate rejected: only invalidated candidate detected",
                 extra={
