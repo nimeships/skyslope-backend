@@ -2,6 +2,7 @@
 
 import os
 import json
+import re
 import traceback
 from datetime import datetime, timezone
 from src.adapter.s3_adapter import S3Adapter
@@ -27,7 +28,7 @@ FIELD_TO_DOC_TYPE = {
     "Customer_LastName":          ["listing_agreement", "buyer_agreement"],
     "Customer_Email":             ["listing_agreement", "buyer_agreement"],
     "ListPrice":                  "listing_agreement",
-    "CommissionPercent":          "listing_agreement",
+    "CommissionPercent":          ["listing_agreement", "listing_amendment"],
     "AdminFeeAmt":                "listing_agreement",
     "GrossOfficeCommission":      "listing_agreement",
     "GrossCommission":            "listing_agreement",
@@ -40,7 +41,7 @@ FIELD_TO_DOC_TYPE = {
     "ContractRatificationDate":   ["residential_contract_of_purchase", "residential_sales_contract"],
     "BasePrice":                  ["residential_contract_of_purchase", "residential_sales_contract"],
     # Residential Sales Contract
-    "SettlementDate":             "residential_sales_contract",
+    "SettlementDate":             ["residential_sales_contract", "listing_amendment"],
     "SalePrice":                  "residential_sales_contract",
     "FirstTrustAmt":              "residential_sales_contract",
     "EarnestAmount":              "residential_sales_contract",
@@ -83,7 +84,7 @@ class DirectPDFExtractionService:
         self.s3 = S3Adapter(config)
         self.bedrock = BedrockAdapter(config)
         self.dynamodb = DynamoDBAdapter(config)
-    
+
     def detect_batch_context(self, file_keys: list) -> dict:
         """Pre-scan all filenames in the batch to detect which document types are present."""
         detected_types = set()
@@ -98,12 +99,149 @@ class DirectPDFExtractionService:
             "detected_types": list(detected_types),
         }
 
+    @staticmethod
+    def _normalize_party_value(value):
+        if value is None:
+            return ""
+        normalized = re.sub(r"\s+", " ", str(value).strip().lower())
+        return normalized
+
+    @staticmethod
+    def _normalize_email(value):
+        return DirectPDFExtractionService._normalize_party_value(value)
+
+    @staticmethod
+    def _normalize_name(first_name, last_name):
+        full_name = " ".join(part for part in [first_name, last_name] if part)
+        return DirectPDFExtractionService._normalize_party_value(full_name)
+
+    @staticmethod
+    def _has_party_identity_match(row: dict) -> bool:
+        customer_name = DirectPDFExtractionService._normalize_name(
+            row.get("Customer_FirstName"), row.get("Customer_LastName")
+        )
+        outside_name = DirectPDFExtractionService._normalize_name(
+            row.get("OutsideCustomer_FirstName"), row.get("OutsideCustomer_LastName")
+        )
+        customer_email = DirectPDFExtractionService._normalize_email(row.get("Customer_Email"))
+        outside_email = DirectPDFExtractionService._normalize_email(row.get("OutsideCustomer_Email"))
+
+        name_match = bool(customer_name and outside_name and customer_name == outside_name)
+        email_match = bool(customer_email and outside_email and customer_email == outside_email)
+        return name_match or email_match
+
+    @staticmethod
+    def _normalize_percentage(value):
+        if value in ("", None, [], {}):
+            return value
+
+        text = str(value).strip().replace("%", "")
+        try:
+            numeric = float(text)
+        except (TypeError, ValueError):
+            return value
+
+        # Convert decimal representation to percentage points (e.g. 0.025 -> 2.5)
+        if 0 < numeric < 1:
+            numeric = numeric * 100
+
+        if numeric < 0 or numeric > 100:
+            return value
+
+        normalized = round(numeric, 3)
+        if normalized.is_integer():
+            return int(normalized)
+        return normalized
+
+    @staticmethod
+    def _normalize_date_value(value):
+        if value in ("", None, [], {}):
+            return value
+
+        raw = str(value).strip()
+        date_patterns = [
+            r"\b\d{4}-\d{2}-\d{2}\b",
+            r"\b\d{1,2}/\d{1,2}/\d{4}\b",
+            r"\b\d{1,2}-\d{1,2}-\d{4}\b",
+        ]
+
+        candidates = []
+        for pattern in date_patterns:
+            candidates.extend(re.findall(pattern, raw))
+
+        if not candidates:
+            return value
+
+        # Prefer the last detected date token when multiple appear in a single value.
+        selected = candidates[-1]
+        formats = ("%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y")
+        for fmt in formats:
+            try:
+                parsed = datetime.strptime(selected, fmt)
+                return parsed.strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+        return value
+
+    def apply_cross_field_guards(self, final_agg, sources_agg, request_id=None):
+        """Resolve cross-field conflicts that the model cannot reliably infer from text alone."""
+        for table_name, rows in final_agg.items():
+            if table_name == "_sources" or not rows:
+                continue
+
+            row = rows[0]
+            has_outside_values = any(
+                row.get(field) not in ("", None, [], {})
+                for field in ["OutsideCustomer_FirstName", "OutsideCustomer_LastName", "OutsideCustomer_Email"]
+            )
+
+            if not has_outside_values:
+                continue
+
+            if self._has_party_identity_match(row):
+                for field in ["OutsideCustomer_FirstName", "OutsideCustomer_LastName", "OutsideCustomer_Email"]:
+                    row[field] = None
+                    if sources_agg.get(table_name) and sources_agg[table_name]:
+                        sources_agg[table_name][0].pop(field, None)
+
+                logger.warning(
+                    "OutsideCustomer matched Customer identity and was cleared",
+                    extra={
+                        'request_id': request_id,
+                        'table': table_name,
+                        'reason': 'duplicate_party_identity'
+                    }
+                )
+
     def build_system_instructions(self, schema_json, batch_context: dict = None):
+        scenario_hint = ""
+        if batch_context:
+            if batch_context.get("has_buyer_agreement") and not batch_context.get("has_listing_agreement"):
+                scenario_hint = """
+<BATCH-SCENARIO-HINT>
+Detected batch context: BUYER AGREEMENT package.
+Apply role mapping strictly:
+- Customer = BUYER
+- OutsideCustomer = SELLER
+</BATCH-SCENARIO-HINT>
+"""
+            elif batch_context.get("has_listing_agreement") and not batch_context.get("has_buyer_agreement"):
+                scenario_hint = """
+<BATCH-SCENARIO-HINT>
+Detected batch context: LISTING AGREEMENT package.
+Apply role mapping strictly:
+- Customer = SELLER
+- OutsideCustomer = BUYER
+</BATCH-SCENARIO-HINT>
+"""
+
         return f"""<SYSTEM_INSTRUCTIONS>
 REAL ESTATE DOCUMENT EXTRACTION PIPELINE
 =======================================
 You are an expert real estate document analyst with 20+ years experience processing Virginia/NVAR forms.
 Your job: Extract ONLY the specified fields from the provided document text into the EXACT JSON schema below.
+
+{scenario_hint}
 
 
 CRITICAL CONSTRAINTS (MANDATORY):
@@ -174,12 +312,13 @@ Under "LISTING PRICE" section:
 
 
 Under "LISTING BROKER COMPENSATION" / "BROKER'S COMPENSATION" section:
-- CommissionPercent (Calculate as follows:
-  - Find the TOTAL broker compensation % from "BROKER'S COMPENSATION" section (e.g. 4.5%)
-  - Find the cooperating/buyer agent % from "AUTHORITY TO COOPERATE WITH OTHER BROKERS" section (e.g. 2.5%)
-  - If BOTH values exist: CommissionPercent = Total % - Cooperating Broker % (e.g. 4.5 - 2.5 = 2)
-  - If ONLY the total broker compensation % exists and NO cooperating broker % is found: CommissionPercent = Total % as-is (e.g. 4.5)
-  - Do NOT multiply. Only convert decimal to percent if shown as decimal like 0.025 → 2.5)
+- CommissionPercent (Use BUYER BROKER COMPENSATION percentage when present, especially from any addendum:
+    - PRIORITY 1: Buyer Broker Compensation Addendum / amendment value (e.g. 2.5%)
+    - PRIORITY 2: Cooperating/buyer agent % from "AUTHORITY TO COOPERATE WITH OTHER BROKERS"
+    - PRIORITY 3: Total broker compensation % if no buyer-broker specific value is available
+    - If multiple candidates exist, ignore crossed-out/struck-through values and keep the valid replacement
+    - Check checkbox-style rows and split lines where percent appears on next line
+    - Do NOT multiply. Only convert decimal to percent if shown as decimal like 0.025 → 2.5)
 - AdminFeeAmt (Look for broker compensation amount in this section)
 
 **XREF REFERRAL FEE RULE (CRITICAL):**
@@ -208,7 +347,11 @@ Identify which scenario applies by checking whether a Listing Agreement or Buyer
 
 === RESIDENTIAL SALES CONTRACT ===
 (Same as Residential Contract of Purchase)
-- SettlementDate (Project settlement date — look for this in the sales contract)
+- SettlementDate (Use anchor-based extraction for the "Project Settlement Date" label:
+    - Extract the date on the same line or immediately next line after the project settlement label
+    - Exclude nearby unrelated dates such as Date of Offer, Agreement Date, and Contract Date
+    - If one date is crossed-out/struck-through and another date is inserted nearby, ignore the crossed-out date and use the replacement
+    - If an amendment/addendum later updates settlement date, use the latest valid updated value)
 - SalePrice (Final sale price — look for this in the sales contract)
 - FirstTrustAmt (Look for "First Trust" field and use the number/amount value next to it — if it is a percentage then do not use it)
 - EarnestAmount (Look for "Deposit" field and use the deposit amount value)
@@ -226,6 +369,8 @@ Identify which scenario applies by checking whether a Listing Agreement or Buyer
 === LISTING AMENDMENT / CHANGE OF STATUS / EXTENSION ===
 (Documents named COS_extension, amendment, addendum, or "Change of Status" that modify the original Listing Agreement)
 - MLSExpirationDate (If document says "Extend the expiration date to [DATE]" or similar, use that new date. This OVERRIDES the expiration date from the original Listing Agreement or Agent Full — it is the most recent/latest expiration date.)
+- SettlementDate (If amendment/addendum explicitly updates settlement date, use updated value as final SettlementDate.)
+- CommissionPercent (If amendment/addendum provides Buyer Broker Compensation percentage, use that as final CommissionPercent.)
 
 
 === BRIGHT MLS ===
@@ -269,7 +414,7 @@ Output only valid JSON. No Markdown. No Explanations.
         """Load JSON schema from S3"""
         content = self.s3.download_file(schema_key)
         return json.loads(content)
-    
+
     def init_agg_from_schema(self, schema_json):
         """Initialize aggregation structure and parallel sources tracker from schema"""
         final_agg = {}
@@ -283,7 +428,7 @@ Output only valid JSON. No Markdown. No Explanations.
                 final_agg[table_name] = []
                 sources_agg[table_name] = []
         return final_agg, sources_agg
-    
+
     def detect_doc_type(self, filename: str) -> str:
         """Fallback: estimate document type from filename keywords.
         NOTE: Document type is primarily detected from the page heading by Claude (_doc_type field).
@@ -329,6 +474,11 @@ Output only valid JSON. No Markdown. No Explanations.
                     if value in ("", None, [], {}):
                         continue
 
+                    if field in ("SettlementDate", "ContractRatificationDate", "MLSExpirationDate"):
+                        value = self._normalize_date_value(value)
+                    elif field == "CommissionPercent":
+                        value = self._normalize_percentage(value)
+
                     # Source-aware check: reject field if it comes from wrong document type
                     expected_doc_type = FIELD_TO_DOC_TYPE.get(field)
                     allowed_types = expected_doc_type if isinstance(expected_doc_type, list) else [expected_doc_type]
@@ -346,19 +496,20 @@ Output only valid JSON. No Markdown. No Explanations.
                             )
                             continue
 
-                    # Amendment docs overwrite MLSExpirationDate if the value changed —
-                    # ensures the latest amendment's date always wins over earlier ones.
-                    is_amendment_date_change = (
+                    # Amendment docs overwrite selected mutable fields if values changed,
+                    # so correction/addendum values can replace earlier contract values.
+                    amendment_overwrite_fields = {"MLSExpirationDate", "SettlementDate", "CommissionPercent"}
+                    is_amendment_field_change = (
                         detected_doc_type == "listing_amendment"
-                        and field == "MLSExpirationDate"
+                        and field in amendment_overwrite_fields
                         and target.get(field) not in ("", None, [], {})
                         and target.get(field) != value
                     )
 
-                    if is_amendment_date_change or target.get(field) in ("", None, [], {}):
+                    if is_amendment_field_change or target.get(field) in ("", None, [], {}):
                         target[field] = value
                         source_target[field] = filename
-    
+
     def validate_sources(self, final_agg, sources_agg, request_id):
         """Post-extraction validation: verify every populated field came from its correct document type.
 
@@ -406,7 +557,7 @@ Output only valid JSON. No Markdown. No Explanations.
 
         return warnings
 
-    def process_single_pdf(self, pdf_key, schema, output_prefix, request_id, result_cache=None):
+    def process_single_pdf(self, pdf_key, schema, output_prefix, request_id, result_cache=None, batch_context=None):
         """
         Process a single document file directly with Claude.
 
@@ -468,7 +619,7 @@ Output only valid JSON. No Markdown. No Explanations.
                     return {'success': True, 'data': cached_result, 'file': filename}
 
             # Build system prompt
-            system_prompt = self.build_system_instructions(schema)
+            system_prompt = self.build_system_instructions(schema, batch_context=batch_context)
 
             # Send file directly to Claude (cache miss)
             bedrock_response = self.bedrock.invoke_claude_with_pdf(pdf_bytes, system_prompt, request_id=request_id)
@@ -547,7 +698,7 @@ Output only valid JSON. No Markdown. No Explanations.
                 'error': str(e),
                 'error_type': error_type
             }
-    
+
     def run_extraction(self, processed_file_keys, schema_key, request_id, result_cache=None, folder_name=None):
         """
         Run LLM directly on documents (PDF and images only).
@@ -572,6 +723,17 @@ Output only valid JSON. No Markdown. No Explanations.
             # Load schema and initialize aggregator
             schema = self.load_schema(schema_key)
             final_agg, sources_agg = self.init_agg_from_schema(schema)
+            batch_context = self.detect_batch_context(processed_file_keys)
+
+            logger.info(
+                "Detected batch context for role mapping",
+                extra={
+                    'request_id': request_id,
+                    'detected_types': batch_context.get('detected_types', []),
+                    'has_buyer_agreement': batch_context.get('has_buyer_agreement', False),
+                    'has_listing_agreement': batch_context.get('has_listing_agreement', False),
+                }
+            )
 
             output_prefix = f"output/{request_id}"
             total_files = len(processed_file_keys)
@@ -592,7 +754,14 @@ Output only valid JSON. No Markdown. No Explanations.
             for key in processed_file_keys:
                 completed_count += 1
 
-                result = self.process_single_pdf(key, schema, output_prefix, request_id, result_cache)
+                result = self.process_single_pdf(
+                    key,
+                    schema,
+                    output_prefix,
+                    request_id,
+                    result_cache,
+                    batch_context=batch_context,
+                )
 
                 all_results.append(result)
 
@@ -637,6 +806,9 @@ Output only valid JSON. No Markdown. No Explanations.
                         'stage': STAGE_EXTRACTION
                     }
                 )
+
+            # Post-extraction semantic guard for role confusion and duplicate parties.
+            self.apply_cross_field_guards(final_agg, sources_agg, request_id=request_id)
 
             # Post-extraction validation: check all fields came from correct document types
             self.validate_sources(final_agg, sources_agg, request_id)
