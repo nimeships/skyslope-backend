@@ -80,6 +80,21 @@ class DirectPDFExtractionService:
     Skips Textract OCR - faster and supports images natively.
     """
 
+    _DATE_PATTERNS = (
+        r"\b\d{4}-\d{2}-\d{2}\b",
+        r"\b\d{1,2}/\d{1,2}/\d{4}\b",
+        r"\b\d{1,2}-\d{1,2}-\d{4}\b",
+    )
+    _VALUE_POSITIVE_HINTS = (
+        "replace", "replaced", "replacement", "updated", "update", "new",
+        "corrected", "correction", "final", "amendment", "addendum", "annotation",
+        "stamp", "above", "beside", "inserted"
+    )
+    _VALUE_INVALID_HINTS = (
+        "crossed out", "crossed-out", "struck", "strikethrough", "strike through",
+        "void", "invalid", "deleted", "removed", "lined through", "line-through"
+    )
+
     def __init__(self, config: PipelineConfig):
         self.s3 = S3Adapter(config)
         self.bedrock = BedrockAdapter(config)
@@ -159,14 +174,9 @@ class DirectPDFExtractionService:
             return value
 
         raw = str(value).strip()
-        date_patterns = [
-            r"\b\d{4}-\d{2}-\d{2}\b",
-            r"\b\d{1,2}/\d{1,2}/\d{4}\b",
-            r"\b\d{1,2}-\d{1,2}-\d{4}\b",
-        ]
 
         candidates = []
-        for pattern in date_patterns:
+        for pattern in DirectPDFExtractionService._DATE_PATTERNS:
             candidates.extend(re.findall(pattern, raw))
 
         if not candidates:
@@ -181,6 +191,87 @@ class DirectPDFExtractionService:
                 return parsed.strftime("%Y-%m-%d")
             except ValueError:
                 continue
+        return value
+
+    @staticmethod
+    def _build_date_candidates(raw_value: str):
+        """Extract date tokens and attach context score for corrected/final-value resolution."""
+        if not raw_value:
+            return []
+
+        candidates = []
+        lowered = raw_value.lower()
+        combined_pattern = "|".join(DirectPDFExtractionService._DATE_PATTERNS)
+        for idx, match in enumerate(re.finditer(combined_pattern, raw_value)):
+            token = match.group(0)
+            window_start = max(0, match.start() - 24)
+            window_end = min(len(raw_value), match.end() + 24)
+            context = lowered[window_start:window_end]
+
+            score = 0
+            if any(hint in context for hint in DirectPDFExtractionService._VALUE_POSITIVE_HINTS):
+                score += 4
+            if any(hint in context for hint in DirectPDFExtractionService._VALUE_INVALID_HINTS):
+                score -= 4
+            score += idx * 0.8  # Later occurrence often corresponds to corrected replacement.
+
+            candidates.append({
+                "token": token,
+                "score": score,
+                "context": context,
+                "index": idx,
+            })
+        return candidates
+
+    def _resolve_date_value(self, field: str, value, request_id=None, source_file=None):
+        if value in ("", None, [], {}):
+            return value
+
+        raw = str(value).strip()
+        candidates = self._build_date_candidates(raw)
+        if not candidates:
+            return value
+
+        has_invalid_marker = any(hint in raw.lower() for hint in self._VALUE_INVALID_HINTS)
+        selected = max(candidates, key=lambda item: (item["score"], item["index"]))
+
+        has_positive_candidate = any(candidate["score"] > 0 for candidate in candidates)
+
+        # If all detected candidates appear invalidated and no replacement signal exists, return null.
+        if field == "SettlementDate" and has_invalid_marker and not has_positive_candidate:
+            logger.warning(
+                "SettlementDate rejected: only invalidated candidate detected",
+                extra={
+                    'request_id': request_id,
+                    'field': field,
+                    'source_file': source_file,
+                    'raw_value': raw,
+                    'reason': 'only_invalidated_candidate'
+                }
+            )
+            return None
+
+        resolved = self._normalize_date_value(selected["token"])
+        if field == "SettlementDate" and len(candidates) > 1:
+            logger.info(
+                "SettlementDate resolved from multiple candidates",
+                extra={
+                    'request_id': request_id,
+                    'field': field,
+                    'source_file': source_file,
+                    'selected_value': resolved,
+                    'selected_score': selected['score'],
+                    'candidate_count': len(candidates),
+                }
+            )
+        return resolved
+
+    def resolve_field_value(self, field: str, value, request_id=None, source_file=None):
+        """Apply deterministic value resolution before merge assignment."""
+        if field in ("SettlementDate", "ContractRatificationDate", "MLSExpirationDate"):
+            return self._resolve_date_value(field, value, request_id=request_id, source_file=source_file)
+        if field == "CommissionPercent":
+            return self._normalize_percentage(value)
         return value
 
     def apply_cross_field_guards(self, final_agg, sources_agg, request_id=None):
@@ -252,6 +343,26 @@ CRITICAL CONSTRAINTS (MANDATORY):
 5. Normalize ALL data: dates=YYYY-MM-DD, $1,250→1250.00, addresses=1 line.
 6. DOCUMENT SOURCE STRICT: Each field MUST be extracted ONLY from its designated document type listed below. Even if the same data appears in another document, DO NOT use it — leave the field null.
 7. NO EXTRA FIELDS: Do NOT populate any field that is not explicitly listed in the DOCUMENT-TO-FIELD-MAPPING below. Every unlisted field MUST be null, no exceptions.
+
+<GENERAL-VALUE-RESOLUTION-RULES>
+When extracting any field value from the document, follow these rules:
+1. Anchor Preference: Always extract values closest to the field label or semantic anchor.
+2. Multiple Candidate Handling:
+    - If multiple candidate values exist for the same field, prefer the most recent/corrected/final value.
+    - Prefer values that appear above, beside, or in annotation/stamp areas when they represent corrections.
+    - Prefer values that are clearly readable and not visually invalidated.
+3. Correction & Strike-through Handling:
+    - If a value is crossed out, struck through, or marked invalid, IGNORE it.
+    - If a replacement value is written nearby (above, beside, or in annotation), ALWAYS choose the replacement value.
+4. Amendment / Addendum Priority:
+    - If a value appears in amendment/addendum/correction sections, it OVERRIDES earlier main-document values.
+5. Ignore Irrelevant Context:
+    - Do not extract values from unrelated labels or nearby sections that do not match the target field.
+6. Output Constraint:
+    - Return only ONE final resolved value per field.
+    - Do not return multiple candidates or ambiguous outputs.
+Goal: Return the final, corrected, authoritative value as legally interpreted in the document.
+</GENERAL-VALUE-RESOLUTION-RULES>
 
 
 <DOCUMENT-PRIORITY-ORDER>
@@ -441,7 +552,7 @@ Output only valid JSON. No Markdown. No Explanations.
                     return doc_type
         return "unknown"
 
-    def merge_into_single_row(self, final_agg, sources_agg, llm_result, filename):
+    def merge_into_single_row(self, final_agg, sources_agg, llm_result, filename, request_id=None):
         """Merge LLM result into final aggregation.
 
         Source-aware: each field is only accepted from its designated document type.
@@ -474,27 +585,25 @@ Output only valid JSON. No Markdown. No Explanations.
                     if value in ("", None, [], {}):
                         continue
 
-                    if field in ("SettlementDate", "ContractRatificationDate", "MLSExpirationDate"):
-                        value = self._normalize_date_value(value)
-                    elif field == "CommissionPercent":
-                        value = self._normalize_percentage(value)
+                    value = self.resolve_field_value(field, value, request_id=request_id, source_file=filename)
+                    if value in ("", None, [], {}):
+                        continue
 
                     # Source-aware check: reject field if it comes from wrong document type
                     expected_doc_type = FIELD_TO_DOC_TYPE.get(field)
                     allowed_types = expected_doc_type if isinstance(expected_doc_type, list) else [expected_doc_type]
-                    if expected_doc_type and detected_doc_type != "unknown":
-                        if detected_doc_type not in allowed_types:
-                            logger.warning(
-                                f"Field '{field}' rejected from wrong document: "
-                                f"expected '{expected_doc_type}', got '{detected_doc_type}' ({filename})",
-                                extra={
-                                    'field': field,
-                                    'expected_doc_type': expected_doc_type,
-                                    'detected_doc_type': detected_doc_type,
-                                    'source_file': filename
-                                }
-                            )
-                            continue
+                    if expected_doc_type and detected_doc_type != "unknown" and detected_doc_type not in allowed_types:
+                        logger.warning(
+                            f"Field '{field}' rejected from wrong document: "
+                            f"expected '{expected_doc_type}', got '{detected_doc_type}' ({filename})",
+                            extra={
+                                'field': field,
+                                'expected_doc_type': expected_doc_type,
+                                'detected_doc_type': detected_doc_type,
+                                'source_file': filename
+                            }
+                        )
+                        continue
 
                     # Amendment docs overwrite selected mutable fields if values changed,
                     # so correction/addendum values can replace earlier contract values.
@@ -767,7 +876,13 @@ Output only valid JSON. No Markdown. No Explanations.
 
                 if result.get('success'):
                     successful_count += 1
-                    self.merge_into_single_row(final_agg, sources_agg, result.get('data'), result.get('file'))
+                    self.merge_into_single_row(
+                        final_agg,
+                        sources_agg,
+                        result.get('data'),
+                        result.get('file'),
+                        request_id=request_id,
+                    )
                 else:
                     failed_count += 1
 
