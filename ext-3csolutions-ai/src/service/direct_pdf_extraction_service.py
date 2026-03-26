@@ -60,7 +60,10 @@ FIELD_TO_DOC_TYPE = {
 # Keyword patterns used to identify document type from filename
 DOC_TYPE_FILENAME_PATTERNS = {
     "listing_agreement":                ["listing", "exclusive", "erts", "nvar"],
-    "buyer_agreement":                  ["buyer agreement", "buyer_agreement", "buyeragreement", "buyer-agreement"],
+    "buyer_agreement":                  [
+        "buyer agreement", "buyer_agreement", "buyeragreement", "buyer-agreement",
+        "buyer agency agreement", "buyer_agency_agreement", "buyer-agency-agreement"
+    ],
     "residential_contract_of_purchase": ["contract of purchase", "rcp", "contract_of_purchase"],
     "residential_sales_contract":       ["sales contract", "k1117", "sales_contract"],
     "agent_full":                       ["agent full", "agent_full", "agentfull", "mris", "full listing", "full_listing", "copy of mris"],
@@ -88,7 +91,7 @@ class DirectPDFExtractionService:
     _VALUE_POSITIVE_HINTS = (
         "replace", "replaced", "replacement", "updated", "update", "new",
         "corrected", "correction", "final", "amendment", "addendum", "annotation",
-        "stamp", "above", "beside", "inserted"
+        "stamp", "above", "beside", "inserted", "overwritten", "written above"
     )
     _VALUE_INVALID_HINTS = (
         "crossed out", "crossed-out", "struck", "strikethrough", "strike through",
@@ -234,16 +237,29 @@ class DirectPDFExtractionService:
 
         has_invalid_marker = any(hint in raw.lower() for hint in self._VALUE_INVALID_HINTS)
         selected = max(candidates, key=lambda item: (item["score"], -item["index"]))
+        strict_date_fields = {"SettlementDate", "ContractRatificationDate", "MLSExpirationDate"}
 
-        has_positive_candidate = any(candidate["score"] > 0 for candidate in candidates)
+        has_positive_hint = any(hint in raw.lower() for hint in self._VALUE_POSITIVE_HINTS)
 
-        if not has_positive_candidate and len(candidates) >= 2:
+        if not has_positive_hint and len(candidates) >= 2:
+            if field in strict_date_fields:
+                logger.warning(
+                    "Date field rejected: multiple candidates without correction signal",
+                    extra={
+                        'request_id': request_id,
+                        'field': field,
+                        'source_file': source_file,
+                        'raw_value': raw,
+                        'reason': 'ambiguous_multiple_candidates'
+                    }
+                )
+                return None
             selected = candidates[0]
 
         # If all detected candidates appear invalidated and no replacement signal exists, return null.
-        if field == "SettlementDate" and has_invalid_marker and not has_positive_candidate and len(candidates) == 1:
+        if field in strict_date_fields and has_invalid_marker and not has_positive_hint and len(candidates) == 1:
             logger.warning(
-                "SettlementDate rejected: only invalidated candidate detected",
+                "Date field rejected: only invalidated candidate detected",
                 extra={
                     'request_id': request_id,
                     'field': field,
@@ -357,6 +373,9 @@ When extracting any field value from the document, follow these rules:
 3. Correction & Strike-through Handling:
     - If a value is crossed out, struck through, or marked invalid, IGNORE it.
     - If a replacement value is written nearby (above, beside, or in annotation), ALWAYS choose the replacement value.
+    - This correction rule applies to ALL fields, not just one specific field.
+    - If one value is struck through and another value is written above/beside, NEVER return the struck-through value.
+    - If strike-through is present but replacement value is unreadable/uncertain, return null for that field.
 4. Amendment / Addendum Priority:
     - If a value appears in amendment/addendum/correction sections, it OVERRIDES earlier main-document values.
 5. Ignore Irrelevant Context:
@@ -465,6 +484,8 @@ Identify which scenario applies by checking whether a Listing Agreement or Buyer
     - Extract the date on the same line or immediately next line after the project settlement label
     - Exclude nearby unrelated dates such as Date of Offer, Agreement Date, and Contract Date
     - If one date is crossed-out/struck-through and another date is inserted nearby, ignore the crossed-out date and use the replacement
+    - The replacement may be handwritten or typed above the original line. Treat this as the final authoritative date even if it is not on the same baseline
+    - Example pattern: "05/01/2026" crossed out with "04/17/2026" written above -> output "2026-04-17"
     - If an amendment/addendum later updates settlement date, use the latest valid updated value)
 - SalePrice (Final sale price — look for this in the sales contract)
 - FirstTrustAmt (Look for "First Trust" field and use the number/amount value next to it — if it is a percentage then do not use it)
