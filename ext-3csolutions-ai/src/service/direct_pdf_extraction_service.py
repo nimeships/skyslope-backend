@@ -3,6 +3,7 @@
 import os
 import json
 import re
+import hashlib
 import traceback
 from datetime import datetime, timezone
 from src.adapter.s3_adapter import S3Adapter
@@ -15,6 +16,34 @@ from src.utils.constants import (
 )
 
 logger = get_logger(__name__)
+
+AGGREGATION_CACHE_VERSION = os.getenv("AGGREGATION_CACHE_VERSION", "v2")
+
+PARTY_FIELD_GROUP_FALLBACK_POLICIES = (
+    {
+        "name": "outside_customer_listing_amendment_fallback",
+        "left_prefix": "Customer",
+        "right_prefix": "OutsideCustomer",
+        "fallback_doc_types": {"listing_amendment"},
+        "required_batch_context": {
+            "has_buyer_agreement": True,
+            "has_listing_agreement": False,
+        },
+        "right_expected_doc_types": {
+            "residential_contract_of_purchase",
+            "residential_sales_contract",
+        },
+        "trigger": "missing_or_identity_match",
+    },
+)
+
+PARTY_IDENTITY_GUARD_POLICIES = (
+    {
+        "name": "customer_vs_outside_customer",
+        "left_prefix": "Customer",
+        "right_prefix": "OutsideCustomer",
+    },
+)
 
 # Maps each extractable field to its expected source document type(s).
 # A list means the field is accepted from multiple document types (Bright MLS takes priority for address fields).
@@ -114,8 +143,26 @@ class DirectPDFExtractionService:
         return {
             "has_buyer_agreement": "buyer_agreement" in detected_types,
             "has_listing_agreement": "listing_agreement" in detected_types,
-            "detected_types": list(detected_types),
+            "detected_types": sorted(list(detected_types)),
         }
+
+    def _build_cache_salt(self, schema_json, batch_context):
+        schema_hash = hashlib.sha256(
+            json.dumps(schema_json, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        context_hash = hashlib.sha256(
+            json.dumps(batch_context or {}, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        prompt_hash = hashlib.sha256(
+            self.build_system_instructions(schema_json, batch_context=batch_context).encode("utf-8")
+        ).hexdigest()
+        return "|".join([
+            AGGREGATION_CACHE_VERSION,
+            self.bedrock.model_id,
+            schema_hash,
+            context_hash,
+            prompt_hash,
+        ])
 
     @staticmethod
     def _normalize_party_value(value):
@@ -134,19 +181,99 @@ class DirectPDFExtractionService:
         return DirectPDFExtractionService._normalize_party_value(full_name)
 
     @staticmethod
-    def _has_party_identity_match(row: dict) -> bool:
-        customer_name = DirectPDFExtractionService._normalize_name(
-            row.get("Customer_FirstName"), row.get("Customer_LastName")
-        )
-        outside_name = DirectPDFExtractionService._normalize_name(
-            row.get("OutsideCustomer_FirstName"), row.get("OutsideCustomer_LastName")
-        )
-        customer_email = DirectPDFExtractionService._normalize_email(row.get("Customer_Email"))
-        outside_email = DirectPDFExtractionService._normalize_email(row.get("OutsideCustomer_Email"))
+    def _field_prefix(prefix: str) -> str:
+        return f"{prefix}_"
 
-        name_match = bool(customer_name and outside_name and customer_name == outside_name)
-        email_match = bool(customer_email and outside_email and customer_email == outside_email)
+    @staticmethod
+    def _get_prefixed_fields(row: dict, prefix: str):
+        token = DirectPDFExtractionService._field_prefix(prefix)
+        return [field for field in row.keys() if field.startswith(token)]
+
+    @staticmethod
+    def _batch_context_matches(batch_context: dict, required_context: dict) -> bool:
+        if not required_context:
+            return True
+        if not batch_context:
+            return False
+        return all(batch_context.get(key) == expected for key, expected in required_context.items())
+
+    @staticmethod
+    def _is_null_like(value) -> bool:
+        return value in ("", None, [], {})
+
+    @staticmethod
+    def _has_party_identity_match(
+        row: dict,
+        left_prefix: str = "Customer",
+        right_prefix: str = "OutsideCustomer",
+    ) -> bool:
+        left_name = DirectPDFExtractionService._normalize_name(
+            row.get(f"{left_prefix}_FirstName"),
+            row.get(f"{left_prefix}_LastName"),
+        )
+        right_name = DirectPDFExtractionService._normalize_name(
+            row.get(f"{right_prefix}_FirstName"),
+            row.get(f"{right_prefix}_LastName"),
+        )
+        left_email = DirectPDFExtractionService._normalize_email(row.get(f"{left_prefix}_Email"))
+        right_email = DirectPDFExtractionService._normalize_email(row.get(f"{right_prefix}_Email"))
+
+        name_match = bool(left_name and right_name and left_name == right_name)
+        email_match = bool(left_email and right_email and left_email == right_email)
         return name_match or email_match
+
+    def _should_allow_party_group_fallback(self, target_row: dict, batch_context: dict, policy: dict) -> bool:
+        if not self._batch_context_matches(batch_context, policy.get("required_batch_context", {})):
+            return False
+
+        right_prefix = policy["right_prefix"]
+        left_prefix = policy["left_prefix"]
+        right_fields = self._get_prefixed_fields(target_row, right_prefix)
+        if not right_fields:
+            return False
+
+        trigger = policy.get("trigger", "missing_or_identity_match")
+        has_any_right_value = any(
+            not self._is_null_like(target_row.get(field))
+            for field in right_fields
+        )
+
+        if trigger == "missing_or_identity_match":
+            if not has_any_right_value:
+                return True
+            return self._has_party_identity_match(
+                target_row,
+                left_prefix=left_prefix,
+                right_prefix=right_prefix,
+            )
+
+        return False
+
+    def _select_party_group_fallback_policy(
+        self,
+        field: str,
+        expected_doc_type,
+        detected_doc_type: str,
+        target_row: dict,
+        batch_context: dict,
+    ):
+        expected_types = set(expected_doc_type if isinstance(expected_doc_type, list) else [expected_doc_type])
+
+        for policy in PARTY_FIELD_GROUP_FALLBACK_POLICIES:
+            right_prefix = policy["right_prefix"]
+            if not field.startswith(self._field_prefix(right_prefix)):
+                continue
+            if detected_doc_type not in policy.get("fallback_doc_types", set()):
+                continue
+
+            required_expected = policy.get("right_expected_doc_types")
+            if required_expected and expected_types and not expected_types.intersection(required_expected):
+                continue
+
+            if self._should_allow_party_group_fallback(target_row, batch_context, policy):
+                return policy
+
+        return None
 
     @staticmethod
     def _normalize_percentage(value):
@@ -300,26 +427,53 @@ class DirectPDFExtractionService:
                 continue
 
             row = rows[0]
-            has_outside_values = any(
-                row.get(field) not in ("", None, [], {})
-                for field in ["OutsideCustomer_FirstName", "OutsideCustomer_LastName", "OutsideCustomer_Email"]
-            )
+            for guard_policy in PARTY_IDENTITY_GUARD_POLICIES:
+                left_prefix = guard_policy["left_prefix"]
+                right_prefix = guard_policy["right_prefix"]
+                right_fields = self._get_prefixed_fields(row, right_prefix)
+                if not right_fields:
+                    continue
 
-            if not has_outside_values:
-                continue
+                has_right_values = any(
+                    not self._is_null_like(row.get(field))
+                    for field in right_fields
+                )
+                if not has_right_values:
+                    continue
 
-            if self._has_party_identity_match(row):
-                for field in ["OutsideCustomer_FirstName", "OutsideCustomer_LastName", "OutsideCustomer_Email"]:
+                if not self._has_party_identity_match(
+                    row,
+                    left_prefix=left_prefix,
+                    right_prefix=right_prefix,
+                ):
+                    continue
+
+                left_fields = self._get_prefixed_fields(row, left_prefix)
+                observed_values = {
+                    field: row.get(field)
+                    for field in [*left_fields, *right_fields]
+                }
+                observed_sources = {
+                    field: (sources_agg.get(table_name) or [{}])[0].get(field)
+                    for field in right_fields
+                }
+
+                for field in right_fields:
                     row[field] = None
                     if sources_agg.get(table_name) and sources_agg[table_name]:
                         sources_agg[table_name][0].pop(field, None)
 
                 logger.warning(
-                    "OutsideCustomer matched Customer identity and was cleared",
+                    "Party identity guard cleared fallback-side fields",
                     extra={
                         'request_id': request_id,
                         'table': table_name,
-                        'reason': 'duplicate_party_identity'
+                        'guard_policy': guard_policy.get("name"),
+                        'left_prefix': left_prefix,
+                        'right_prefix': right_prefix,
+                        'reason': 'duplicate_party_identity',
+                        'observed_values': observed_values,
+                        'observed_sources': observed_sources,
                     }
                 )
 
@@ -462,7 +616,7 @@ Under "LISTING BROKER COMPENSATION" / "BROKER'S COMPENSATION" section:
 - XREF1Amount (Only populate if document explicitly mentions a referral fee dollar amount)
 
 
-**CONTRACT DOCUMENT RULE: Any document whose heading contains the word "CONTRACT" (e.g., "RESIDENTIAL SALES CONTRACT", "RESIDENTIAL CONTRACT OF PURCHASE", or any similar contract document) must be treated as equally important. Extract buyer information, sale price, settlement date, and ratification date from ANY such contract document using the same rules below.**
+**CONTRACT DOCUMENT RULE: Any document whose heading contains the word "CONTRACT" (e.g., "RESIDENTIAL SALES CONTRACT", "RESIDENTIAL CONTRACT OF PURCHASE", or any similar contract document) must be treated as equally important. Extract party information according to Scenario A/B role mapping below, plus sale price, settlement date, and ratification date from ANY such contract document using the same rules below.**
 
 === RESIDENTIAL CONTRACT OF PURCHASE ===
 (Same as Residential Sales Contract)
@@ -471,9 +625,19 @@ Under "LISTING BROKER COMPENSATION" / "BROKER'S COMPENSATION" section:
 - SCENARIO B (Buyer Agreement uploaded / NM represents BUYER): OutsideCustomer = SELLER. Extract SELLER's name and email from this document.
 Identify which scenario applies by checking whether a Listing Agreement or Buyer Agreement was uploaded.
 
-- OutsideCustomer_FirstName (SCENARIO A → BUYER's first name. SCENARIO B → SELLER's first name. If TWO names listed, put the FIRST FULL NAME here.)
-- OutsideCustomer_LastName (SCENARIO A → BUYER's last name. SCENARIO B → SELLER's last name. If TWO names listed, put the SECOND FULL NAME here.)
+PARTY NAME EXTRACTION CONSTRAINTS (APPLIES TO BOTH SCENARIOS):
+- These forms may NOT contain predefined first-name/last-name fields. Derive names from role-labeled party sections (BUYER/SELLER/OWNER/SIGNATURE blocks).
+- Never assign names by visual order alone (e.g., first name on page). Always map by party role label.
+- If a full legal name appears in one text run, split as:
+    - FirstName = first token
+    - LastName = remaining tokens
+- If only one token is present and you cannot confidently split, set FirstName = null and LastName = full token.
+- If multiple parties exist for the same role and schema expects one record, use the primary/first clearly labeled party for that role.
+
+- OutsideCustomer_FirstName (SCENARIO A → BUYER's first name. SCENARIO B → SELLER's first name.)
+- OutsideCustomer_LastName (SCENARIO A → BUYER's last name. SCENARIO B → SELLER's last name.)
 - OutsideCustomer_Email (SCENARIO A → BUYER's email. SCENARIO B → SELLER's email.)
+- CRITICAL ROLE DISAMBIGUATION: If both BUYER and SELLER names are visible in the same contract, NEVER copy BUYER identity into OutsideCustomer for SCENARIO B. In SCENARIO B, OutsideCustomer must come from SELLER party labels/signature blocks only.
 - ContractRatificationDate (Look for the LAST date of signature on the contract — this is the date all parties have signed/ratified. Labels to look for: "Date of Ratification", "Date of Ratification (see DEFINITIONS)", "Acceptance Date", "Date of Acceptance". The date value may appear ON THE NEXT LINE below the label, not inline — still use it. Accept formats like m/dd/yyyy, mm/dd/yyyy, or any date format. IMPORTANT: The "Agreement Date", "Date of Agreement", or any date that represents when the agreement document itself was drafted or accepted as an agreement is NOT the ratification date — do NOT use it. If the last signature date / ratification date cannot be found, return null.)
 - BasePrice (Look for "Base price", "Base price of the house", or "Base price of home" in the Sales Price breakdown or Schedule of Payments section. Extract the dollar amount. Do NOT use Total Sales Price, Lot Premium, Option Price, or Discount.)
 
@@ -576,7 +740,7 @@ Output only valid JSON. No Markdown. No Explanations.
                     return doc_type
         return "unknown"
 
-    def merge_into_single_row(self, final_agg, sources_agg, llm_result, filename, request_id=None):
+    def merge_into_single_row(self, final_agg, sources_agg, llm_result, filename, request_id=None, batch_context=None):
         """Merge LLM result into final aggregation.
 
         Source-aware: each field is only accepted from its designated document type.
@@ -605,6 +769,8 @@ Output only valid JSON. No Markdown. No Explanations.
             for row in rows:
                 if not isinstance(row, dict):
                     continue
+
+                applied_fallback_prefixes = set()
                 for field, value in row.items():
                     if value in ("", None, [], {}):
                         continue
@@ -616,18 +782,44 @@ Output only valid JSON. No Markdown. No Explanations.
                     # Source-aware check: reject field if it comes from wrong document type
                     expected_doc_type = FIELD_TO_DOC_TYPE.get(field)
                     allowed_types = expected_doc_type if isinstance(expected_doc_type, list) else [expected_doc_type]
+                    fallback_policy = None
                     if expected_doc_type and detected_doc_type != "unknown" and detected_doc_type not in allowed_types:
-                        logger.warning(
-                            f"Field '{field}' rejected from wrong document: "
-                            f"expected '{expected_doc_type}', got '{detected_doc_type}' ({filename})",
-                            extra={
-                                'field': field,
-                                'expected_doc_type': expected_doc_type,
-                                'detected_doc_type': detected_doc_type,
-                                'source_file': filename
-                            }
+                        fallback_policy = self._select_party_group_fallback_policy(
+                            field,
+                            expected_doc_type,
+                            detected_doc_type,
+                            target,
+                            batch_context,
                         )
-                        continue
+                        if fallback_policy:
+                            right_prefix = fallback_policy["right_prefix"]
+                            if right_prefix not in applied_fallback_prefixes:
+                                for grouped_field in self._get_prefixed_fields(target, right_prefix):
+                                    target[grouped_field] = None
+                                    source_target.pop(grouped_field, None)
+                                applied_fallback_prefixes.add(right_prefix)
+                                logger.info(
+                                    "Applying party-group fallback from disallowed source",
+                                    extra={
+                                        'request_id': request_id,
+                                        'source_file': filename,
+                                        'detected_doc_type': detected_doc_type,
+                                        'fallback_policy': fallback_policy.get("name"),
+                                        'fallback_right_prefix': right_prefix,
+                                    }
+                                )
+                        else:
+                            logger.warning(
+                                f"Field '{field}' rejected from wrong document: "
+                                f"expected '{expected_doc_type}', got '{detected_doc_type}' ({filename})",
+                                extra={
+                                    'field': field,
+                                    'expected_doc_type': expected_doc_type,
+                                    'detected_doc_type': detected_doc_type,
+                                    'source_file': filename
+                                }
+                            )
+                            continue
 
                     # Amendment docs overwrite selected mutable fields if values changed,
                     # so correction/addendum values can replace earlier contract values.
@@ -639,7 +831,7 @@ Output only valid JSON. No Markdown. No Explanations.
                         and target.get(field) != value
                     )
 
-                    if is_amendment_field_change or target.get(field) in ("", None, [], {}):
+                    if is_amendment_field_change or target.get(field) in ("", None, [], {}) or bool(fallback_policy):
                         target[field] = value
                         source_target[field] = filename
 
@@ -690,7 +882,7 @@ Output only valid JSON. No Markdown. No Explanations.
 
         return warnings
 
-    def process_single_pdf(self, pdf_key, schema, output_prefix, request_id, result_cache=None, batch_context=None):
+    def process_single_pdf(self, pdf_key, schema, output_prefix, request_id, result_cache=None, batch_context=None, cache_salt=""):
         """
         Process a single document file directly with Claude.
 
@@ -731,7 +923,7 @@ Output only valid JSON. No Markdown. No Explanations.
             # Check result cache (if enabled)
             cached_result = None
             if result_cache:
-                file_hash = result_cache.calculate_hash(pdf_bytes)
+                file_hash = result_cache.calculate_hash(pdf_bytes, salt=cache_salt)
                 cached_result = result_cache.get(file_hash)
 
                 if cached_result:
@@ -767,7 +959,7 @@ Output only valid JSON. No Markdown. No Explanations.
 
             # Store in cache (if enabled)
             if result_cache and not cached_result:
-                file_hash = result_cache.calculate_hash(pdf_bytes)
+                file_hash = result_cache.calculate_hash(pdf_bytes, salt=cache_salt)
                 result_cache.set(file_hash, result)
                 logger.info(
                     f"Cache MISS: {filename} - stored in cache",
@@ -856,7 +1048,9 @@ Output only valid JSON. No Markdown. No Explanations.
             # Load schema and initialize aggregator
             schema = self.load_schema(schema_key)
             final_agg, sources_agg = self.init_agg_from_schema(schema)
-            batch_context = self.detect_batch_context(processed_file_keys)
+            ordered_file_keys = sorted(processed_file_keys, key=lambda key: os.path.basename(key).lower())
+            batch_context = self.detect_batch_context(ordered_file_keys)
+            cache_salt = self._build_cache_salt(schema, batch_context)
 
             logger.info(
                 "Detected batch context for role mapping",
@@ -869,7 +1063,7 @@ Output only valid JSON. No Markdown. No Explanations.
             )
 
             output_prefix = f"output/{request_id}"
-            total_files = len(processed_file_keys)
+            total_files = len(ordered_file_keys)
 
             # Update status
             self.dynamodb.update_status(
@@ -884,7 +1078,7 @@ Output only valid JSON. No Markdown. No Explanations.
             all_results = []
 
             # Sequential execution — one file at a time to ensure correct merge order
-            for key in processed_file_keys:
+            for key in ordered_file_keys:
                 completed_count += 1
 
                 result = self.process_single_pdf(
@@ -894,6 +1088,7 @@ Output only valid JSON. No Markdown. No Explanations.
                     request_id,
                     result_cache,
                     batch_context=batch_context,
+                    cache_salt=cache_salt,
                 )
 
                 all_results.append(result)
@@ -906,6 +1101,7 @@ Output only valid JSON. No Markdown. No Explanations.
                         result.get('data'),
                         result.get('file'),
                         request_id=request_id,
+                        batch_context=batch_context,
                     )
                 else:
                     failed_count += 1

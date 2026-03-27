@@ -69,17 +69,21 @@ class ResultCache:
         else:
             logger.info(f"Result cache initialized: {cache_prefix}")
 
-    def calculate_hash(self, file_bytes: bytes) -> str:
+    def calculate_hash(self, file_bytes: bytes, salt: str = "") -> str:
         """
         Calculate SHA256 hash of file content.
 
         Args:
             file_bytes: Raw file content
+            salt: Optional context salt (prompt/model/schema/batch context)
 
         Returns:
             Hex-encoded SHA256 hash
         """
         sha = hashlib.sha256()
+        if salt:
+            sha.update(salt.encode('utf-8'))
+            sha.update(b"|")
         sha.update(file_bytes)
         return sha.hexdigest()
 
@@ -187,28 +191,30 @@ class ResultCache:
                 exc_info=True
             )
 
-    def get_with_file_bytes(self, file_bytes: bytes) -> Optional[Dict[str, Any]]:
+    def get_with_file_bytes(self, file_bytes: bytes, salt: str = "") -> Optional[Dict[str, Any]]:
         """
         Convenience method: calculate hash and get from cache.
 
         Args:
             file_bytes: Raw file content
+            salt: Optional context salt
 
         Returns:
             Cached result or None
         """
-        file_hash = self.calculate_hash(file_bytes)
+        file_hash = self.calculate_hash(file_bytes, salt=salt)
         return self.get(file_hash)
 
-    def set_with_file_bytes(self, file_bytes: bytes, result: Dict[str, Any]):
+    def set_with_file_bytes(self, file_bytes: bytes, result: Dict[str, Any], salt: str = ""):
         """
         Convenience method: calculate hash and store in cache.
 
         Args:
             file_bytes: Raw file content
             result: Extraction result to cache
+            salt: Optional context salt
         """
-        file_hash = self.calculate_hash(file_bytes)
+        file_hash = self.calculate_hash(file_bytes, salt=salt)
         self.set(file_hash, result)
 
     def get_stats(self) -> Dict[str, Any]:
